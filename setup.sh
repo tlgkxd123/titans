@@ -19,8 +19,6 @@ fi
 pip install -q --upgrade pip --break-system-packages
 pip install -q torch --index-url https://download.pytorch.org/whl/cu124 --break-system-packages
 pip install -q datasets transformers bitsandbytes accelerate tqdm --break-system-packages
-
-# Install titans package
 pip install -q -e . --break-system-packages
 
 # Set environment
