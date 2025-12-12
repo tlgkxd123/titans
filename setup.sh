@@ -10,7 +10,7 @@ echo "🚀 Setting up Titans..."
 if [ -d "titans" ]; then
     cd titans && git pull
 else
-    git clone https://github.com/YOUR_USERNAME/agitrust.git titans
+    git clone https://github.com/tlgkxd123/titans.git
     cd titans
 fi
 
