@@ -1,6 +1,6 @@
 #!/bin/bash
 # Titans Quick Setup for Cloud GPUs (RunPod, Lium, Lambda, etc.)
-# Usage: curl -fsSL https://raw.githubusercontent.com/YOUR_USER/agitrust/main/setup.sh | bash
+# Usage: curl -fsSL https://raw.githubusercontent.com/tlgkxd123/titans/main/setup.sh | bash
 
 set -e
 

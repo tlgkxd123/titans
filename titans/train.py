@@ -7,6 +7,7 @@ Features:
 - Flash Attention 2 + BFloat16
 - torch.compile support
 - Streaming dataset sharding
+- Rich real-time progress visualization
 """
 
 import os
@@ -17,11 +18,242 @@ import torch.nn as nn
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, IterableDataset, DistributedSampler
-from typing import Optional, Dict, Iterator, Any
+from typing import Optional, Dict, Iterator, Any, List
 from itertools import islice
+from collections import deque
 import argparse
-from tqdm import tqdm
 import time
+import shutil
+
+from rich.console import Console
+from rich.live import Live
+from rich.table import Table
+from rich.panel import Panel
+from rich.progress import Progress, BarColumn, TextColumn, TimeRemainingColumn, SpinnerColumn
+from rich.layout import Layout
+from rich.text import Text
+from rich import box
+
+
+class TrainingProgressBar:
+    """Rich real-time progress bar with live metrics."""
+    
+    def __init__(self, max_steps: int, log_every: int = 50):
+        self.max_steps = max_steps
+        self.log_every = log_every
+        self.console = Console()
+        
+        # Metrics tracking
+        self.current_step = 0
+        self.current_loss = 0.0
+        self.current_lr = 0.0
+        self.tokens_per_sec = 0
+        self.start_time = time.time()
+        self.step_times = deque(maxlen=100)
+        self.loss_history = deque(maxlen=100)
+        self.best_loss = float('inf')
+        self.total_tokens = 0
+        
+        # GPU metrics
+        self.gpu_memory_used = 0
+        self.gpu_memory_total = 0
+        self.gpu_utilization = 0
+        
+        self.live = None
+    
+    def _get_gpu_stats(self):
+        """Get GPU memory and utilization stats."""
+        try:
+            if torch.cuda.is_available():
+                self.gpu_memory_used = torch.cuda.memory_allocated() / 1e9
+                self.gpu_memory_total = torch.cuda.get_device_properties(0).total_memory / 1e9
+                # Try to get utilization (requires pynvml)
+                try:
+                    import pynvml
+                    pynvml.nvmlInit()
+                    handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+                    util = pynvml.nvmlDeviceGetUtilizationRates(handle)
+                    self.gpu_utilization = util.gpu
+                except:
+                    self.gpu_utilization = -1
+        except:
+            pass
+    
+    def _create_progress_bar(self) -> Text:
+        """Create ASCII progress bar."""
+        width = 40
+        filled = int(width * self.current_step / self.max_steps)
+        bar = "█" * filled + "░" * (width - filled)
+        pct = self.current_step / self.max_steps * 100
+        return Text(f"[{bar}] {pct:5.1f}%", style="bold cyan")
+    
+    def _create_sparkline(self, values: List[float], width: int = 20) -> str:
+        """Create a sparkline from values."""
+        if not values:
+            return "─" * width
+        
+        chars = "▁▂▃▄▅▆▇█"
+        min_val, max_val = min(values), max(values)
+        if max_val == min_val:
+            return chars[4] * min(len(values), width)
+        
+        # Sample if too many values
+        if len(values) > width:
+            step = len(values) / width
+            sampled = [values[int(i * step)] for i in range(width)]
+        else:
+            sampled = list(values)
+        
+        result = ""
+        for v in sampled:
+            idx = int((v - min_val) / (max_val - min_val + 1e-10) * (len(chars) - 1))
+            result += chars[idx]
+        return result
+    
+    def _format_time(self, seconds: float) -> str:
+        """Format seconds to human readable."""
+        if seconds < 60:
+            return f"{seconds:.0f}s"
+        elif seconds < 3600:
+            return f"{seconds/60:.1f}m"
+        else:
+            return f"{seconds/3600:.1f}h"
+    
+    def _build_display(self) -> Panel:
+        """Build the full display panel."""
+        self._get_gpu_stats()
+        
+        # Calculate ETA
+        elapsed = time.time() - self.start_time
+        if self.current_step > 0:
+            eta = elapsed / self.current_step * (self.max_steps - self.current_step)
+        else:
+            eta = 0
+        
+        # Calculate avg step time
+        avg_step_time = sum(self.step_times) / len(self.step_times) if self.step_times else 0
+        
+        # Build layout
+        layout = Layout()
+        
+        # Header with progress
+        progress_text = self._create_progress_bar()
+        step_text = Text(f"Step {self.current_step:,} / {self.max_steps:,}", style="bold white")
+        
+        # Metrics table
+        metrics = Table(box=box.SIMPLE, show_header=False, padding=(0, 2))
+        metrics.add_column("Metric", style="dim")
+        metrics.add_column("Value", style="bold")
+        metrics.add_column("Metric", style="dim")
+        metrics.add_column("Value", style="bold")
+        
+        # Row 1: Loss and LR
+        loss_style = "green" if self.current_loss < self.best_loss else "yellow"
+        metrics.add_row(
+            "📉 Loss", f"[{loss_style}]{self.current_loss:.4f}[/]",
+            "📈 Best", f"[green]{self.best_loss:.4f}[/]" if self.best_loss < float('inf') else "N/A"
+        )
+        
+        # Row 2: Speed and LR
+        metrics.add_row(
+            "⚡ Tokens/s", f"[cyan]{self.tokens_per_sec:,}[/]",
+            "🎯 LR", f"[magenta]{self.current_lr:.2e}[/]"
+        )
+        
+        # Row 3: Time
+        metrics.add_row(
+            "⏱️  Elapsed", f"[white]{self._format_time(elapsed)}[/]",
+            "⏳ ETA", f"[white]{self._format_time(eta)}[/]"
+        )
+        
+        # Row 4: GPU
+        gpu_pct = (self.gpu_memory_used / self.gpu_memory_total * 100) if self.gpu_memory_total > 0 else 0
+        gpu_color = "green" if gpu_pct < 70 else "yellow" if gpu_pct < 90 else "red"
+        metrics.add_row(
+            "🎮 VRAM", f"[{gpu_color}]{self.gpu_memory_used:.1f}GB / {self.gpu_memory_total:.1f}GB[/]",
+            "📊 Util", f"[cyan]{self.gpu_utilization}%[/]" if self.gpu_utilization >= 0 else "[dim]N/A[/]"
+        )
+        
+        # Loss sparkline
+        loss_spark = self._create_sparkline(list(self.loss_history))
+        spark_text = Text(f"Loss trend: {loss_spark}", style="yellow")
+        
+        # Combine into panel
+        content = Text()
+        content.append("\n")
+        content.append(step_text)
+        content.append("  ")
+        content.append(progress_text)
+        content.append("\n\n")
+        
+        # Build final panel with table
+        return Panel(
+            Layout(
+                Layout(content, name="header", size=3),
+                Layout(metrics, name="metrics", size=5),
+                Layout(Panel(spark_text, border_style="dim", box=box.ROUNDED), name="sparkline", size=3),
+            ),
+            title="[bold cyan]🚀 Titans Training[/]",
+            subtitle=f"[dim]Total tokens: {self.total_tokens:,}[/]",
+            border_style="cyan",
+            box=box.DOUBLE
+        )
+    
+    def start(self):
+        """Start the live display."""
+        self.start_time = time.time()
+        self.live = Live(
+            self._build_display(),
+            console=self.console,
+            refresh_per_second=4,
+            transient=False
+        )
+        self.live.start()
+    
+    def update(
+        self,
+        step: int,
+        loss: float,
+        lr: float,
+        tokens_per_sec: int,
+        batch_tokens: int = 0
+    ):
+        """Update progress bar with new metrics."""
+        step_time = time.time() - (self.start_time if not self.step_times else time.time())
+        self.step_times.append(step_time)
+        
+        self.current_step = step
+        self.current_loss = loss
+        self.current_lr = lr
+        self.tokens_per_sec = tokens_per_sec
+        self.total_tokens += batch_tokens
+        
+        self.loss_history.append(loss)
+        if loss < self.best_loss:
+            self.best_loss = loss
+        
+        if self.live:
+            self.live.update(self._build_display())
+    
+    def stop(self):
+        """Stop the live display."""
+        if self.live:
+            self.live.stop()
+            
+            # Print final summary
+            elapsed = time.time() - self.start_time
+            self.console.print()
+            self.console.print(Panel(
+                f"[bold green]✅ Training Complete![/]\n\n"
+                f"📊 Final Loss: [cyan]{self.current_loss:.4f}[/]\n"
+                f"🏆 Best Loss: [green]{self.best_loss:.4f}[/]\n"
+                f"⏱️  Total Time: [white]{self._format_time(elapsed)}[/]\n"
+                f"📈 Total Tokens: [cyan]{self.total_tokens:,}[/]\n"
+                f"⚡ Avg Tokens/s: [yellow]{int(self.total_tokens / elapsed):,}[/]",
+                title="[bold]Training Summary[/]",
+                border_style="green",
+                box=box.DOUBLE
+            ))
 
 # Use TF32 on Ampere/Hopper
 torch.set_float32_matmul_precision('high')
@@ -198,10 +430,15 @@ class TitansTrainer:
         accum_loss = torch.tensor(0.0, device="cuda")
         
         data_iter = iter(self.train_loader)
+        
+        # Use custom rich progress bar on rank 0
+        pbar = None
         if self.rank == 0:
-            pbar = tqdm(total=self.max_steps, desc="Training")
+            pbar = TrainingProgressBar(self.max_steps, self.log_every)
+            pbar.start()
         
         start_time = time.time()
+        batch_tokens = 0
         
         while step < self.max_steps:
             self.optimizer.zero_grad(set_to_none=True)
@@ -215,6 +452,7 @@ class TitansTrainer:
                 
                 input_ids = batch["input_ids"].cuda()
                 labels = batch["labels"].cuda()
+                batch_tokens = input_ids.shape[0] * input_ids.shape[1]
                 
                 # BFloat16 context
                 with torch.amp.autocast('cuda', dtype=torch.bfloat16):
@@ -238,14 +476,21 @@ class TitansTrainer:
                 if dist.is_initialized():
                     dist.all_reduce(accum_loss, op=dist.ReduceOp.AVG)
                 
-                if self.rank == 0:
+                if self.rank == 0 and pbar:
                     lr = self.scheduler.get_last_lr()[0]
-                    tps = (self.log_every * self.grad_accum_steps * 
-                           batch["input_ids"].shape[0] * batch["input_ids"].shape[1] * 
-                           (dist.get_world_size() if dist.is_initialized() else 1)) / (time.time() - start_time)
+                    elapsed = time.time() - start_time
+                    tokens_this_interval = (self.log_every * self.grad_accum_steps * 
+                           batch_tokens * 
+                           (dist.get_world_size() if dist.is_initialized() else 1))
+                    tps = int(tokens_this_interval / elapsed) if elapsed > 0 else 0
                     
-                    pbar.set_postfix({"loss": f"{accum_loss.item():.4f}", "tok/s": f"{int(tps):,}"})
-                    pbar.update(self.log_every)
+                    pbar.update(
+                        step=step,
+                        loss=accum_loss.item(),
+                        lr=lr,
+                        tokens_per_sec=tps,
+                        batch_tokens=tokens_this_interval
+                    )
                     start_time = time.time()
                 
                 accum_loss.fill_(0.0)
@@ -255,7 +500,8 @@ class TitansTrainer:
 
         if self.rank == 0:
             self.save_checkpoint(step, final=True)
-            pbar.close()
+            if pbar:
+                pbar.stop()
 
     def save_checkpoint(self, step, final=False):
         # Unwrap DDP
