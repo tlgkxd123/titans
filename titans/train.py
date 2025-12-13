@@ -58,6 +58,13 @@ class TrainingProgressBar:
         self.gpu_utilization = 0
         
         self.live = None
+        self.status = "Initializing..."
+    
+    def set_status(self, status: str):
+        """Update current status message."""
+        self.status = status
+        if self.live:
+            self.live.update(self._build_display())
     
     def _get_gpu_stats(self):
         """Get GPU memory and utilization stats."""
@@ -132,11 +139,16 @@ class TrainingProgressBar:
         progress_text = self._create_progress_bar()
         step_text = Text(f"Step {self.current_step:,} / {self.max_steps:,}", style="bold white")
         
+        # Status text
+        status_text = Text(f"Status: {self.status}", style="bold yellow")
+        
         # Combine step and progress
         header = Text()
         header.append(step_text)
         header.append("  ")
         header.append(progress_text)
+        header.append("\n")
+        header.append(status_text)
         
         # Metrics table
         metrics = Table(box=box.SIMPLE, show_header=False, padding=(0, 2))
@@ -207,12 +219,7 @@ class TrainingProgressBar:
         """Update progress bar with new metrics."""
         step_time = time.time() - (self.start_time if not self.step_times else time.time())
         self.step_times.append(step_time)
-        
-        self.current_step = step
-        self.current_loss = loss
-        self.current_lr = lr
-        self.tokens_per_sec = tokens_per_sec
-        self.total_tokens += batch_tokens
+        self.status = "Training..."
         
         self.loss_history.append(loss)
         if loss < self.best_loss:
@@ -422,6 +429,7 @@ class TitansTrainer:
         if self.rank == 0:
             pbar = TrainingProgressBar(self.max_steps, self.log_every)
             pbar.start()
+            pbar.set_status("Starting training loop...")
         
         start_time = time.time()
         batch_tokens = 0
@@ -431,7 +439,10 @@ class TitansTrainer:
         while step < self.max_steps:
             self.optimizer.zero_grad(set_to_none=True)
             
-            for _ in range(self.grad_accum_steps):
+            for micro_step in range(self.grad_accum_steps):
+                if self.rank == 0 and pbar:
+                    pbar.set_status(f"Step {step}: Micro-batch {micro_step+1}/{self.grad_accum_steps} - Loading data...")
+
                 try:
                     batch = next(data_iter)
                 except StopIteration:
@@ -443,12 +454,21 @@ class TitansTrainer:
                 batch_tokens = input_ids.shape[0] * input_ids.shape[1]
                 
                 # BFloat16 context
+                if self.rank == 0 and pbar:
+                    pbar.set_status(f"Step {step}: Micro-batch {micro_step+1}/{self.grad_accum_steps} - Forward pass...")
+                
                 with torch.amp.autocast('cuda', dtype=torch.bfloat16):
                     outputs = self.model(input_ids, labels=labels)
                     loss = outputs["loss"] / self.grad_accum_steps
                 
+                if self.rank == 0 and pbar:
+                    pbar.set_status(f"Step {step}: Micro-batch {micro_step+1}/{self.grad_accum_steps} - Backward pass...")
+                
                 loss.backward()
                 accum_loss += loss.detach()
+            
+            if self.rank == 0 and pbar:
+                pbar.set_status(f"Step {step}: Optimizer step...")
             
             # Clip grad
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
