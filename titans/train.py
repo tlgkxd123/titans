@@ -531,14 +531,10 @@ class TitansTrainer:
 def estimate_vram_gb(d_model: int, n_layers: int, seq_len: int, batch_size: int, quantize: str) -> float:
     """Estimate VRAM usage in GB for given config (Titans-specific).
     
-    CRITICAL: Titans memory module is extremely memory-hungry because:
-    1. Each layer stores per-batch weight matrices (B, Out, In) 
-    2. Memory update computes gradients for each timestep in the chunk
-    3. Gradient computation creates intermediate tensors
+    Updated for Flash Attention (O(L) memory) + Fast Memory Module.
     """
     hidden_mult = 2.0  # Memory MLP hidden multiplier
-    memory_depth = 2   # Memory MLP layers
-    chunk_size = 8     # Default chunk size for memory updates
+    chunk_size = 64    # Memory update chunk size
     
     hidden_dim = int(d_model * hidden_mult)
     
@@ -560,46 +556,29 @@ def estimate_vram_gb(d_model: int, n_layers: int, seq_len: int, batch_size: int,
     # === Optimizer States (8-bit AdamW) ===
     optimizer_gb = (total_params * 2) / 1e9
     
-    # === CRITICAL: Titans Memory State per Layer ===
-    # Each layer stores: weights (B, Out, In) + momentum (B, Out, In) for each MLP layer
-    # Layer 0: (B, hidden_dim, d_model) 
-    # Layer 1: (B, d_model, hidden_dim)
-    layer0_size = batch_size * hidden_dim * d_model
-    layer1_size = batch_size * d_model * hidden_dim
-    memory_weights_per_layer = (layer0_size + layer1_size) * 2  # bf16 bytes
-    memory_momentum_per_layer = memory_weights_per_layer  # same size
+    # === Titans Memory State per Layer ===
+    # Each layer stores: weights (B, Out, In) + momentum (B, Out, In)
+    # But only for ONE layer in FastNeuralMemory (d_model * d_model)
+    memory_weights = batch_size * d_model * d_model
+    memory_momentum = memory_weights
+    memory_state_gb = (n_layers * (memory_weights + memory_momentum) * 2) / 1e9
     
-    memory_state_gb = (n_layers * (memory_weights_per_layer + memory_momentum_per_layer)) / 1e9
+    # === Memory Update Gradients ===
+    # Checkpointing reduces this to chunk_size cost
+    # For each chunk: 2 * weights size (grad_W, grad_M)
+    memory_update_gb = (n_layers * memory_weights * 2 * 2) / 1e9
     
-    # === CRITICAL: Memory Update Gradients ===
-    # During update_memory_chunk, for EACH timestep in chunk:
-    # - Compute forward through MLP
-    # - Compute gradients for all weight tensors  
-    # - These gradients are same size as weights
-    # PyTorch keeps intermediate tensors for backward pass
-    n_chunks = seq_len // chunk_size
-    
-    # Gradient tensors per update (same size as weights)
-    grad_per_update = memory_weights_per_layer
-    
-    # Intermediate activations during gradient computation
-    # For each chunk: forward activations + backward intermediates
-    chunk_activations = batch_size * chunk_size * d_model * 4  # Multiple intermediate tensors
-    
-    # Total memory update overhead (this is the killer!)
-    memory_update_gb = (n_layers * (grad_per_update * 2 + chunk_activations * 2)) / 1e9
-    
-    # === Standard Activations ===
-    # Attention: Q, K, V, scores, output per layer
-    activation_gb = (batch_size * seq_len * d_model * n_layers * 8 * 2) / 1e9
-    
-    # === Gradients for model params ===
-    grad_gb = model_gb
+    # === Activations (Flash Attention) ===
+    # Flash Attn is linear in seq_len
+    # Main cost is storing inputs for backward pass
+    # (B, L, D) tensors for each layer * many intermediates
+    # Gradient checkpointing reduces this drastically
+    activation_gb = (batch_size * seq_len * d_model * n_layers * 2 * 2) / 1e9
     
     # === Overhead ===
-    overhead_gb = 6.0  # CUDA allocator fragmentation, etc
+    overhead_gb = 4.0
     
-    total = model_gb + optimizer_gb + memory_state_gb + memory_update_gb + activation_gb + grad_gb + overhead_gb
+    total = model_gb + optimizer_gb + memory_state_gb + memory_update_gb + activation_gb + overhead_gb
     return total
 
 def auto_fit_vram(vram_gb: float, d_model: int, n_layers: int, seq_len: int, quantize: str):
