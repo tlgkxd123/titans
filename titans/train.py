@@ -75,6 +75,7 @@ class StreamingTextDataset(IterableDataset):
         text_column: str = "text",
         rank: int = 0,
         world_size: int = 1,
+        max_samples: Optional[int] = None,
     ):
         self.dataset_name = dataset_name
         self.dataset_config = dataset_config
@@ -84,6 +85,7 @@ class StreamingTextDataset(IterableDataset):
         self.text_column = text_column
         self.rank = rank
         self.world_size = world_size
+        self.max_samples = max_samples
     
     def __iter__(self) -> Iterator[Dict[str, torch.Tensor]]:
         load_kwargs = {"split": self.split, "streaming": True}
@@ -112,7 +114,12 @@ class StreamingTextDataset(IterableDataset):
         iterator = islice(dataset, iter_start, None, iter_step)
         
         buffer = []
+        sample_count = 0
         for example in iterator:
+            # Check if we've reached the sample limit
+            if self.max_samples is not None and sample_count >= self.max_samples:
+                break
+                
             text = example.get(self.text_column, "")
             if not text:
                 continue
@@ -121,8 +128,13 @@ class StreamingTextDataset(IterableDataset):
             buffer.extend(tokens)
             
             while len(buffer) >= self.seq_len + 1:
+                # Check limit again before yielding
+                if self.max_samples is not None and sample_count >= self.max_samples:
+                    break
+                    
                 chunk = buffer[:self.seq_len + 1]
                 buffer = buffer[self.seq_len:]
+                sample_count += 1
                 yield {
                     "input_ids": torch.tensor(chunk[:-1], dtype=torch.long),
                     "labels": torch.tensor(chunk[1:], dtype=torch.long)
@@ -256,22 +268,168 @@ class TitansTrainer:
         torch.save(model_to_save.state_dict(), path)
         print(f"\nSaved checkpoint {path}")
 
+def estimate_vram_gb(d_model: int, n_layers: int, seq_len: int, batch_size: int, quantize: str) -> float:
+    """Estimate VRAM usage in GB for given config (Titans-specific).
+    
+    CRITICAL: Titans memory module is extremely memory-hungry because:
+    1. Each layer stores per-batch weight matrices (B, Out, In) 
+    2. Memory update computes gradients for each timestep in the chunk
+    3. Gradient computation creates intermediate tensors
+    """
+    hidden_mult = 2.0  # Memory MLP hidden multiplier
+    memory_depth = 2   # Memory MLP layers
+    chunk_size = 8     # Default chunk size for memory updates
+    
+    hidden_dim = int(d_model * hidden_mult)
+    
+    # === Model Parameters ===
+    # Standard transformer params per layer
+    attn_params = 4 * d_model * d_model  # Q, K, V, O projections
+    ffn_params = 2 * d_model * hidden_dim  # up + down
+    
+    # Memory module params per layer
+    memory_mlp_params = d_model * hidden_dim + hidden_dim * d_model  # 2-layer MLP
+    memory_proj_params = 3 * d_model * d_model  # W_K, W_V, W_Q
+    
+    params_per_layer = attn_params + ffn_params + memory_proj_params + memory_mlp_params
+    total_params = n_layers * params_per_layer + d_model * 50257
+    
+    bytes_per_param = 0.5 if quantize != "none" else 2
+    model_gb = (total_params * bytes_per_param) / 1e9
+    
+    # === Optimizer States (8-bit AdamW) ===
+    optimizer_gb = (total_params * 2) / 1e9
+    
+    # === CRITICAL: Titans Memory State per Layer ===
+    # Each layer stores: weights (B, Out, In) + momentum (B, Out, In) for each MLP layer
+    # Layer 0: (B, hidden_dim, d_model) 
+    # Layer 1: (B, d_model, hidden_dim)
+    layer0_size = batch_size * hidden_dim * d_model
+    layer1_size = batch_size * d_model * hidden_dim
+    memory_weights_per_layer = (layer0_size + layer1_size) * 2  # bf16 bytes
+    memory_momentum_per_layer = memory_weights_per_layer  # same size
+    
+    memory_state_gb = (n_layers * (memory_weights_per_layer + memory_momentum_per_layer)) / 1e9
+    
+    # === CRITICAL: Memory Update Gradients ===
+    # During update_memory_chunk, for EACH timestep in chunk:
+    # - Compute forward through MLP
+    # - Compute gradients for all weight tensors  
+    # - These gradients are same size as weights
+    # PyTorch keeps intermediate tensors for backward pass
+    n_chunks = seq_len // chunk_size
+    
+    # Gradient tensors per update (same size as weights)
+    grad_per_update = memory_weights_per_layer
+    
+    # Intermediate activations during gradient computation
+    # For each chunk: forward activations + backward intermediates
+    chunk_activations = batch_size * chunk_size * d_model * 4  # Multiple intermediate tensors
+    
+    # Total memory update overhead (this is the killer!)
+    memory_update_gb = (n_layers * (grad_per_update * 2 + chunk_activations * 2)) / 1e9
+    
+    # === Standard Activations ===
+    # Attention: Q, K, V, scores, output per layer
+    activation_gb = (batch_size * seq_len * d_model * n_layers * 8 * 2) / 1e9
+    
+    # === Gradients for model params ===
+    grad_gb = model_gb
+    
+    # === Overhead ===
+    overhead_gb = 6.0  # CUDA allocator fragmentation, etc
+    
+    total = model_gb + optimizer_gb + memory_state_gb + memory_update_gb + activation_gb + grad_gb + overhead_gb
+    return total
+
+def auto_fit_vram(vram_gb: float, d_model: int, n_layers: int, seq_len: int, quantize: str):
+    """Auto-calculate batch_size and grad_accum to fit in VRAM.
+    
+    Uses empirically-tested configurations for Titans architecture.
+    The memory module is extremely VRAM-hungry due to per-batch weight matrices.
+    """
+    # Target 75% utilization (Titans needs headroom for memory state updates)
+    target_vram = vram_gb * 0.75
+    
+    # Empirically tested configs for d_model=1024, n_layers=16
+    # Format: (batch_size, seq_len, approx_vram_gb)
+    # These values are conservative and tested on H100 80GB
+    if quantize != "none":
+        # 4-bit quantization reduces model size but memory state is still full precision
+        tested_configs = [
+            (2, 1024, 45),
+            (2, 512, 35),
+            (1, 1024, 30),
+            (1, 512, 22),
+            (1, 256, 15),
+        ]
+    else:
+        # Full precision (bf16)
+        tested_configs = [
+            (2, 512, 65),
+            (1, 1024, 55),
+            (1, 512, 40),
+            (1, 256, 25),
+            (1, 128, 15),
+        ]
+    
+    # Scale by model size (relative to reference d_model=1024, n_layers=16)
+    size_scale = (d_model / 1024) ** 2 * (n_layers / 16)
+    
+    for batch_size, test_seq, base_vram in tested_configs:
+        scaled_vram = base_vram * size_scale
+        if scaled_vram <= target_vram:
+            actual_seq = min(seq_len, test_seq)
+            # Calculate grad_accum to reach effective batch of 32
+            grad_accum = max(1, 32 // batch_size)
+            return batch_size, grad_accum, scaled_vram, actual_seq
+    
+    # Fallback: minimum config
+    return 1, 32, 15 * size_scale, 128
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--variant", default="mag")
     parser.add_argument("--dataset", default="fineweb")
     parser.add_argument("--d_model", type=int, default=1024)
     parser.add_argument("--n_layers", type=int, default=16)
-    parser.add_argument("--seq_len", type=int, default=2048)
-    parser.add_argument("--batch_size", type=int, default=4)
-    parser.add_argument("--grad_accum", type=int, default=8)
+    parser.add_argument("--seq_len", type=int, default=None,
+                        help="Sequence length (auto-calculated if not set)")
+    parser.add_argument("--batch_size", type=int, default=None, 
+                        help="Micro batch size (auto-calculated if not set)")
+    parser.add_argument("--grad_accum", type=int, default=None,
+                        help="Gradient accumulation steps (auto-calculated if not set)")
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--max_steps", type=int, default=100000)
     parser.add_argument("--compile", action="store_true", help="Enable torch.compile")
     parser.add_argument("--quantize", type=str, default="none", 
                         choices=["none", "nf4", "fp4"],
                         help="4-bit quantization: nf4, fp4, or none")
+    parser.add_argument("--max_samples", type=int, default=None,
+                        help="Limit dataset to this many samples (for testing or memory constraints)")
+    parser.add_argument("--vram", type=int, default=80,
+                        help="Available VRAM in GB (default: 80 for H100)")
     args = parser.parse_args()
+    
+    # Auto-fit to VRAM if key params not specified
+    if args.batch_size is None or args.grad_accum is None or args.seq_len is None:
+        requested_seq = args.seq_len or 2048
+        auto_bs, auto_ga, estimated_vram, auto_seq = auto_fit_vram(
+            args.vram, args.d_model, args.n_layers, requested_seq, args.quantize
+        )
+        if args.batch_size is None:
+            args.batch_size = auto_bs
+        if args.grad_accum is None:
+            args.grad_accum = auto_ga
+        if args.seq_len is None:
+            args.seq_len = auto_seq
+        print(f"🎯 Auto-fit for {args.vram}GB VRAM:")
+        print(f"   batch_size={args.batch_size}, grad_accum={args.grad_accum}, seq_len={args.seq_len}")
+        print(f"📊 Estimated VRAM usage: {estimated_vram:.1f}GB / {args.vram}GB")
+    else:
+        # Still show estimate
+        estimated = estimate_vram_gb(args.d_model, args.n_layers, args.seq_len, args.batch_size, args.quantize)
+        print(f"📊 Estimated VRAM usage: {estimated:.1f}GB / {args.vram}GB")
 
     # Dist setup
     rank, local_rank, world_size = setup_distributed()
@@ -289,8 +447,12 @@ def main():
         tokenizer=tokenizer,
         seq_len=args.seq_len,
         rank=rank,
-        world_size=world_size
+        world_size=world_size,
+        max_samples=args.max_samples
     )
+    
+    if rank == 0 and args.max_samples:
+        print(f"📊 Limiting dataset to {args.max_samples:,} samples")
     
     train_loader = DataLoader(
         dataset, batch_size=args.batch_size, num_workers=2, pin_memory=True
