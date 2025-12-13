@@ -2,6 +2,7 @@
 Titans MAG (Memory as Gate) Architecture
 
 Memory and attention branches combined via gating mechanism.
+Now using ultra-fast vectorized memory with analytic gradients.
 """
 
 import torch
@@ -9,7 +10,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import Optional, Tuple, List
 
-from .memory import NeuralMemory, MemoryState
+# Use fast memory module
+from .memory_fast import NeuralMemory, MemoryState
 from .attention import SlidingWindowAttention
 from .persistent import PersistentMemory
 
@@ -23,13 +25,14 @@ class TitansMAGBlock(nn.Module):
         n_heads: int = 8,
         n_persistent: int = 8,
         window_size: int = 256,
-        memory_depth: int = 2,
+        memory_depth: int = 2,  # Ignored in fast mode
         dropout: float = 0.1
     ):
         super().__init__()
         self.d_model = d_model
         
-        self.long_term_memory = NeuralMemory(d_model, memory_depth, chunk_size=8)
+        # Use fast memory with larger chunks for speed
+        self.long_term_memory = NeuralMemory(d_model, chunk_size=64)
         self.persistent_memory = PersistentMemory(n_persistent, d_model)
         self.attention = SlidingWindowAttention(d_model, n_heads, window_size, dropout)
         
@@ -47,7 +50,7 @@ class TitansMAGBlock(nn.Module):
     def forward(self, x: torch.Tensor, memory_state: Optional[MemoryState] = None):
         batch_size = x.shape[0]
         if memory_state is None:
-            memory_state = self.long_term_memory.memory_mlp.get_initial_state(batch_size, x.device)
+            memory_state = self.long_term_memory.get_initial_state(batch_size, x.device)
         
         persistent = self.persistent_memory(batch_size)
         attn_output = self.attn_norm(self.attention(x, prefix=persistent))

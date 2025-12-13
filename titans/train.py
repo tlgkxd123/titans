@@ -353,24 +353,27 @@ def auto_fit_vram(vram_gb: float, d_model: int, n_layers: int, seq_len: int, qua
     
     # Empirically tested configs for d_model=1024, n_layers=16
     # Format: (batch_size, seq_len, approx_vram_gb)
-    # These values are conservative and tested on H100 80GB
+    # UPDATED for FastNeuralMemory (much lower memory usage!)
     if quantize != "none":
-        # 4-bit quantization reduces model size but memory state is still full precision
+        # 4-bit quantization
         tested_configs = [
-            (2, 1024, 45),
-            (2, 512, 35),
-            (1, 1024, 30),
-            (1, 512, 22),
-            (1, 256, 15),
+            (8, 2048, 45),
+            (8, 1024, 30),
+            (4, 2048, 28),
+            (4, 1024, 18),
+            (2, 2048, 16),
+            (2, 1024, 10),
         ]
     else:
-        # Full precision (bf16)
+        # Full precision (bf16) - fast memory uses ~5x less VRAM
         tested_configs = [
-            (2, 512, 65),
-            (1, 1024, 55),
-            (1, 512, 40),
-            (1, 256, 25),
-            (1, 128, 15),
+            (8, 2048, 55),
+            (8, 1024, 35),
+            (4, 2048, 32),
+            (4, 1024, 20),
+            (2, 2048, 18),
+            (2, 1024, 12),
+            (1, 2048, 10),
         ]
     
     # Scale by model size (relative to reference d_model=1024, n_layers=16)
