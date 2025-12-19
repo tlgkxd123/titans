@@ -16,5 +16,5 @@
 
 
 <p align="center">
-**Using Google's Titans Architecture**
+Using Google's Titans Architecture
 </p>
